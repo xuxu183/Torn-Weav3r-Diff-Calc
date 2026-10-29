@@ -1,0 +1,1028 @@
+// ==UserScript==
+// @name         Torn 市场 - Weav3r 差额计算器
+// @namespace    https://www.torn.com/page.php?sid=ItemMarket/
+// @version      2.8
+// @description  报价差额计算、正负差额着色
+// @match        https://www.torn.com/page.php?sid=ItemMarket*
+// @grant        GM_addStyle
+// @run-at       document-idle
+// ==/UserScript==
+
+(() => {
+  'use strict';
+
+  const ID = 'torn-weav3r-diff-panel';
+  const MAX = 5;
+
+  let sortDirection = 'desc';
+  let lastRows = [];
+  let collapsed = false;
+  let dragging = false;
+  let dragOffsetX = 0;
+  let dragOffsetY = 0;
+  let savedHeight = 440;
+
+  const money = n => {
+    const value = Math.round(n);
+    return (value < 0 ? '-$' : '$') +
+      Math.abs(value).toLocaleString('en-US');
+  };
+
+  function getText(root, selectors) {
+    for (const selector of selectors) {
+      const el = root.querySelector(selector);
+      if (el?.textContent.trim()) return el.textContent.trim();
+    }
+    return '';
+  }
+
+  function parsePrice(value) {
+    const match = String(value || '').replace(/,/g, '')
+      .match(/-?\$\s*(\d+(?:\.\d+)?)/);
+    return match ? Number(match[1].replace('$', '')) : 0;
+  }
+
+  function parseQty(value) {
+    const match = String(value || '').replace(/,/g, '')
+      .match(/(\d+(?:\.\d+)?)/);
+    return match ? Number(match[1]) : 1;
+  }
+
+  function esc(value) {
+    return String(value ?? '').replace(/[&<>"']/g, c => ({
+      '&': '&amp;',
+      '<': '&lt;',
+      '>': '&gt;',
+      '"': '&quot;',
+      "'": '&#39;'
+    })[c]);
+  }
+
+  function getMarketListings() {
+    const results = [];
+    const seen = new Set();
+
+    for (const row of document.querySelectorAll(
+      'li[class*="rowWrapper"], li[class*="sellerRow"]'
+    )) {
+      if (results.length >= MAX || seen.has(row)) continue;
+      seen.add(row);
+
+      const img = row.querySelector('img[src*="/images/items/"]');
+      if (!img) continue;
+
+      const rect = row.getBoundingClientRect();
+      if (!rect.width || !rect.height) continue;
+
+      const src = img.getAttribute('src') || '';
+      const itemId = src.match(/\/images\/items\/(\d+)\//)?.[1];
+      const itemPrice = parsePrice(getText(row, ['[class*="price"]']));
+
+      if (!itemId || !itemPrice) continue;
+
+      results.push({
+        id: String(itemId),
+        name: img.alt?.trim() || `Item ${itemId}`,
+        price: itemPrice,
+        qty: parseQty(getText(row, [
+          '[class*="available"]',
+          '[class*="quantity"]'
+        ])),
+        seller: getText(row, [
+          '[class*="userInfo"] a',
+          '[class*="seller"] a',
+          'a[href*="profiles.php"]',
+          'a[href*="userId="]'
+        ]) || '未知卖家'
+      });
+    }
+
+    return results;
+  }
+
+  function getWeav3rListings() {
+    const results = [];
+    const seen = new Set();
+
+    for (const link of document.querySelectorAll('a[href*="tt-item-id="]')) {
+      if (results.length >= MAX || seen.has(link.href)) continue;
+      seen.add(link.href);
+
+      let url;
+
+      try {
+        url = new URL(link.href, location.href);
+      } catch {
+        continue;
+      }
+
+      const itemId = url.searchParams.get('tt-item-id');
+      const itemPrice = parsePrice(getText(link, ['[class*="price"]']));
+
+      if (!itemId || !itemPrice) continue;
+
+      results.push({
+        id: String(itemId),
+        price: itemPrice,
+        qty: parseQty(getText(link, ['[class*="quantity"]'])),
+        seller: getText(link, ['[class*="player-name"]']) || '未知卖家'
+      });
+    }
+
+    return results;
+  }
+
+  function addStyles() {
+    const css = `
+      #${ID} {
+        position:fixed;
+        left:auto;
+        top:auto;
+        right:16px;
+        bottom:16px;
+        width:700px;
+        height:440px;
+        min-width:360px;
+        min-height:160px;
+        max-width:calc(100vw - 8px);
+        max-height:calc(100vh - 8px);
+        display:flex;
+        flex-direction:column;
+        z-index:2147483647;
+        box-sizing:border-box;
+        overflow:hidden;
+        resize:both;
+        background:#111;
+        color:#fff !important;
+        border:1px solid #555;
+        border-radius:8px;
+        box-shadow:0 4px 24px #0009;
+        font:12px/1.45 Arial,sans-serif;
+      }
+
+      #${ID},
+      #${ID} * {
+        box-sizing:border-box;
+        color:#fff !important;
+      }
+
+      #${ID} button {
+        padding:3px 7px;
+        border:1px solid #666;
+        border-radius:4px;
+        background:#292929;
+        color:#fff !important;
+        cursor:pointer;
+        font:inherit;
+      }
+
+      #${ID} button:hover {
+        background:#3a3a3a;
+      }
+
+      #${ID} button.active {
+        background:#444;
+        border-color:#aaa;
+      }
+
+      #${ID} .header {
+        flex:0 0 auto;
+        display:flex;
+        align-items:center;
+        justify-content:space-between;
+        gap:8px;
+        padding:8px 10px;
+        background:#202020;
+        border-bottom:1px solid #444;
+        cursor:move;
+        user-select:none;
+      }
+
+      #${ID} .header strong {
+        color:#fff !important;
+        white-space:nowrap;
+      }
+
+      #${ID} .actions {
+        display:flex;
+        flex-wrap:wrap;
+        gap:4px;
+        cursor:default;
+      }
+
+      #${ID} .status {
+        flex:0 0 auto;
+        padding:6px 10px;
+        background:#171717;
+        border-bottom:1px solid #444;
+        color:#fff !important;
+      }
+
+      #${ID} .content-area {
+        position:relative;
+        flex:1 1 auto;
+        min-height:0;
+        overflow:hidden;
+        background:#111;
+      }
+
+      #${ID} .content {
+        position:absolute;
+        inset:0;
+        width:100%;
+        height:100%;
+        padding:0;
+        overflow-x:auto;
+        overflow-y:auto;
+        scrollbar-width:none !important;
+        -ms-overflow-style:none !important;
+        background:#111;
+      }
+
+      #${ID} .content::-webkit-scrollbar {
+        width:0 !important;
+        height:0 !important;
+        display:none !important;
+      }
+
+      #${ID} .table-stage {
+        width:max-content;
+        min-width:100%;
+        background:#111;
+      }
+
+      #${ID} table {
+        border-collapse:collapse;
+        width:max-content;
+        min-width:100%;
+        background:#111;
+        color:#fff !important;
+      }
+
+      #${ID} thead {
+        position:relative;
+        z-index:4;
+      }
+
+      #${ID} th {
+        position:sticky;
+        top:0;
+        z-index:4;
+        padding:7px 6px;
+        text-align:left;
+        white-space:nowrap;
+        font-weight:normal;
+        color:#fff !important;
+        background:#292929 !important;
+        border-top:1px solid #444;
+        border-bottom:1px solid #666;
+        box-shadow:0 2px 3px #0008;
+      }
+
+      #${ID} td {
+        padding:5px 6px;
+        text-align:left;
+        white-space:nowrap;
+        color:#fff !important;
+        background:#171717;
+        border-top:1px solid #383838;
+      }
+
+      #${ID} tbody tr:hover td {
+        background:#242424;
+      }
+
+      #${ID} td.positive {
+        color:#00df70 !important;
+        font-weight:bold;
+      }
+
+      #${ID} td.negative {
+        color:#ff5252 !important;
+        font-weight:bold;
+      }
+
+      #${ID} .empty {
+        padding:10px 0;
+        color:#fff !important;
+      }
+
+      #${ID} .vertical-scroll {
+        display:none !important;
+      }
+
+      /* 横向滚动条：固定显示，不占用表格布局空间 */
+      #${ID} .horizontal-scroll {
+        position:relative;
+        flex:0 0 12px;
+        height:12px;
+        min-height:12px;
+        overflow:hidden;
+        border-top:1px solid #3a3a3a;
+        background:#252525;
+        user-select:none;
+        touch-action:none;
+      }
+
+      #${ID} .horizontal-scroll[hidden] {
+        display:none !important;
+      }
+
+      #${ID} .horizontal-scroll-thumb {
+        position:absolute;
+        left:0;
+        top:2px;
+        height:6px;
+        min-width:0;
+        border-radius:5px;
+        background:#777;
+        cursor:pointer;
+        touch-action:none;
+      }
+
+      #${ID} .horizontal-scroll-thumb:hover {
+        background:#aaa;
+      }
+
+      #${ID} footer {
+        flex:0 0 auto;
+        padding:6px 10px;
+        border-top:1px solid #444;
+        background:#202020;
+      }
+    `;
+
+    if (typeof GM_addStyle === 'function') {
+      GM_addStyle(css);
+    } else {
+      const style = document.createElement('style');
+      style.textContent = css;
+      document.head.appendChild(style);
+    }
+  }
+
+  function ensurePanel() {
+    let panel = document.getElementById(ID);
+    if (panel) return panel;
+
+    panel = document.createElement('section');
+    panel.id = ID;
+
+    panel.innerHTML = `
+      <header class="header">
+        <strong>市场 / Weav3r 差额计算器</strong>
+        <div class="actions">
+          <button data-action="refresh">刷新</button>
+          <button data-action="asc">差额 ↑</button>
+          <button data-action="desc" class="active">差额 ↓</button>
+          <button data-action="default">默认</button>
+          <button data-action="collapse">−</button>
+          <button data-action="close">×</button>
+        </div>
+      </header>
+
+      <div class="status">等待读取报价</div>
+
+      <div class="content-area">
+        <div class="content">
+          <div class="table-stage"></div>
+        </div>
+        <div class="vertical-scroll">
+          <div class="vertical-thumb"></div>
+        </div>
+      </div>
+
+      <div class="horizontal-scroll"
+           title="横向滚动表格"
+           aria-label="横向滚动表格">
+        <div class="horizontal-scroll-thumb"></div>
+      </div>
+
+      <footer>
+        折后市场价 = 市场价 × 95%；
+        差额 = 折后市场价 − Weav3r 价；
+        总差额 = 差额 × Weav3r 集市数量；
+        差额率 = 差额 ÷ 折后市场价
+      </footer>
+    `;
+
+    document.body.appendChild(panel);
+
+    setupPanelEvents(panel);
+    setupHorizontalScroll(panel);
+    setupVerticalScroll(panel);
+    setupDragging(panel);
+    setupResizeObserver(panel);
+    clampPanel(panel);
+
+    return panel;
+  }
+
+  function setupPanelEvents(panel) {
+    panel.addEventListener('click', event => {
+      const button = event.target.closest('button[data-action]');
+      if (!button) return;
+
+      const action = button.dataset.action;
+
+      if (action === 'refresh') {
+        refresh();
+        return;
+      }
+
+      if (['asc', 'desc', 'default'].includes(action)) {
+        sortDirection = action;
+
+        panel.querySelectorAll(
+          '[data-action="asc"],[data-action="desc"],[data-action="default"]'
+        ).forEach(btn => {
+          btn.classList.toggle('active', btn.dataset.action === action);
+        });
+
+        renderRows();
+        return;
+      }
+
+      if (action === 'collapse') {
+        collapsed = !collapsed;
+
+        const contentArea = panel.querySelector('.content-area');
+        const horizontal = panel.querySelector('.horizontal-scroll');
+        const footer = panel.querySelector('footer');
+
+        if (collapsed) {
+          savedHeight = panel.getBoundingClientRect().height;
+          contentArea.hidden = true;
+          horizontal.hidden = true;
+          footer.hidden = true;
+          button.textContent = '+';
+          panel.style.height = 'auto';
+          panel.style.minHeight = '0';
+        } else {
+          contentArea.hidden = false;
+          horizontal.hidden = false;
+          footer.hidden = false;
+          button.textContent = '−';
+          panel.style.height = `${savedHeight}px`;
+          panel.style.minHeight = '160px';
+
+          requestAnimationFrame(() => {
+            panel._updateVerticalScroll?.();
+            panel._updateHorizontalScroll?.();
+          });
+        }
+
+        return;
+      }
+
+      if (action === 'close') {
+        panel._resizeObserver?.disconnect();
+        panel.remove();
+      }
+    });
+  }
+
+  function setupHorizontalScroll(panel) {
+    const content = panel.querySelector('.content');
+    const stage = panel.querySelector('.table-stage');
+    const bar = panel.querySelector('.horizontal-scroll');
+    const thumb = panel.querySelector('.horizontal-scroll-thumb');
+
+    let scrollLeft = 0;
+    let draggingThumb = false;
+    let pointerStartX = 0;
+    let scrollStart = 0;
+
+    function getMetrics() {
+      const viewportWidth = content.clientWidth;
+      const table = stage.querySelector('table');
+
+      const contentWidth = Math.max(
+        content.scrollWidth,
+        stage.scrollWidth,
+        stage.offsetWidth,
+        table ? table.scrollWidth : 0,
+        viewportWidth
+      );
+
+      const trackWidth = bar.clientWidth;
+      const maxScroll = Math.max(0, contentWidth - viewportWidth);
+
+      let thumbWidth;
+
+      if (maxScroll > 1 && contentWidth > 0) {
+        thumbWidth = Math.min(
+          trackWidth,
+          Math.max(
+            Math.min(24, trackWidth),
+            trackWidth * viewportWidth / contentWidth
+          )
+        );
+      } else {
+        thumbWidth = trackWidth;
+      }
+
+      const maxThumbLeft = Math.max(0, trackWidth - thumbWidth);
+
+      return {
+        viewportWidth,
+        contentWidth,
+        trackWidth,
+        maxScroll,
+        thumbWidth,
+        maxThumbLeft
+      };
+    }
+
+    function updateWidth() {
+      if (!panel.isConnected) return;
+
+      const metrics = getMetrics();
+
+      scrollLeft = Math.max(
+        0,
+        Math.min(scrollLeft, metrics.maxScroll)
+      );
+
+      // 轨道始终显示，只有面板折叠时才隐藏。
+      // 无横向溢出时滑块铺满轨道。
+      bar.hidden = collapsed || metrics.trackWidth <= 0;
+      thumb.style.display = 'block';
+      thumb.style.width =
+        `${Math.min(metrics.trackWidth, metrics.thumbWidth)}px`;
+
+      const thumbLeft = metrics.maxScroll > 1
+        ? scrollLeft / metrics.maxScroll * metrics.maxThumbLeft
+        : 0;
+
+      thumb.style.left = `${thumbLeft}px`;
+
+      if (Math.abs(content.scrollLeft - scrollLeft) > 1) {
+        content.scrollLeft = scrollLeft;
+      }
+    }
+
+    function setScrollFromPointer(clientX, centerThumb) {
+      const rect = bar.getBoundingClientRect();
+      const metrics = getMetrics();
+
+      if (metrics.maxScroll <= 1 || metrics.maxThumbLeft <= 0) return;
+
+      const localX = clientX - rect.left;
+
+      const thumbLeft = Math.max(
+        0,
+        Math.min(
+          centerThumb
+            ? localX - metrics.thumbWidth / 2
+            : localX,
+          metrics.maxThumbLeft
+        )
+      );
+
+      scrollLeft =
+        thumbLeft / metrics.maxThumbLeft * metrics.maxScroll;
+
+      content.scrollLeft = scrollLeft;
+      updateWidth();
+    }
+
+    bar.addEventListener('pointerdown', event => {
+      if (event.button !== 0 || bar.hidden) return;
+
+      if (event.target === thumb) {
+        draggingThumb = true;
+        pointerStartX = event.clientX;
+        scrollStart = content.scrollLeft;
+
+        thumb.setPointerCapture(event.pointerId);
+        event.preventDefault();
+        event.stopPropagation();
+      } else {
+        setScrollFromPointer(event.clientX, true);
+      }
+    });
+
+    thumb.addEventListener('pointermove', event => {
+      if (!draggingThumb) return;
+
+      const metrics = getMetrics();
+      if (metrics.maxThumbLeft <= 0) return;
+
+      const deltaX = event.clientX - pointerStartX;
+
+      scrollLeft =
+        scrollStart +
+        deltaX / metrics.maxThumbLeft * metrics.maxScroll;
+
+      scrollLeft = Math.max(
+        0,
+        Math.min(scrollLeft, metrics.maxScroll)
+      );
+
+      content.scrollLeft = scrollLeft;
+      updateWidth();
+      event.preventDefault();
+    });
+
+    function stopDragging() {
+      draggingThumb = false;
+    }
+
+    thumb.addEventListener('pointerup', stopDragging);
+    thumb.addEventListener('pointercancel', stopDragging);
+
+    content.addEventListener('scroll', () => {
+      scrollLeft = content.scrollLeft;
+      updateWidth();
+    }, { passive: true });
+
+    panel._updateHorizontalScroll = updateWidth;
+
+    requestAnimationFrame(updateWidth);
+  }
+
+  function setupVerticalScroll(panel) {
+    const content = panel.querySelector('.content');
+    const track = panel.querySelector('.vertical-scroll');
+    const thumb = panel.querySelector('.vertical-thumb');
+
+    let draggingThumb = false;
+    let pointerStartY = 0;
+    let scrollStart = 0;
+
+    function updateThumb() {
+      if (!panel.isConnected) return;
+
+      const viewportHeight = content.clientHeight;
+      const scrollHeight = content.scrollHeight;
+      const trackHeight = track.clientHeight;
+
+      if (scrollHeight <= viewportHeight + 1 || trackHeight <= 0) {
+        thumb.style.display = 'none';
+        return;
+      }
+
+      thumb.style.display = 'block';
+
+      const thumbHeight = Math.max(
+        24,
+        trackHeight * viewportHeight / scrollHeight
+      );
+
+      const maxThumbTop = trackHeight - thumbHeight;
+      const maxScroll = scrollHeight - viewportHeight;
+
+      const thumbTop = maxScroll > 0
+        ? content.scrollTop / maxScroll * maxThumbTop
+        : 0;
+
+      thumb.style.height = `${thumbHeight}px`;
+      thumb.style.top = `${thumbTop}px`;
+    }
+
+    content.addEventListener('scroll', updateThumb);
+
+    track.addEventListener('pointerdown', event => {
+      if (event.target === thumb) return;
+      if (thumb.style.display === 'none') return;
+
+      const rect = track.getBoundingClientRect();
+      const thumbHeight = thumb.offsetHeight;
+      const clickY = event.clientY - rect.top;
+
+      const thumbTop = Math.max(
+        0,
+        Math.min(
+          clickY - thumbHeight / 2,
+          track.clientHeight - thumbHeight
+        )
+      );
+
+      const maxThumbTop = track.clientHeight - thumbHeight;
+      const maxScroll = content.scrollHeight - content.clientHeight;
+
+      content.scrollTop = maxThumbTop > 0
+        ? thumbTop / maxThumbTop * maxScroll
+        : 0;
+
+      updateThumb();
+    });
+
+    thumb.addEventListener('pointerdown', event => {
+      if (event.button !== 0) return;
+
+      draggingThumb = true;
+      pointerStartY = event.clientY;
+      scrollStart = content.scrollTop;
+
+      thumb.setPointerCapture(event.pointerId);
+      event.preventDefault();
+      event.stopPropagation();
+    });
+
+    thumb.addEventListener('pointermove', event => {
+      if (!draggingThumb) return;
+
+      const trackHeight = track.clientHeight;
+      const thumbHeight = thumb.offsetHeight;
+      const maxThumbTop = trackHeight - thumbHeight;
+      const maxScroll = content.scrollHeight - content.clientHeight;
+
+      if (maxThumbTop <= 0) return;
+
+      const deltaY = event.clientY - pointerStartY;
+      const scrollDelta = deltaY / maxThumbTop * maxScroll;
+
+      content.scrollTop = scrollStart + scrollDelta;
+      updateThumb();
+    });
+
+    function stopDragging() {
+      draggingThumb = false;
+    }
+
+    thumb.addEventListener('pointerup', stopDragging);
+    thumb.addEventListener('pointercancel', stopDragging);
+
+    panel._updateVerticalScroll = updateThumb;
+  }
+
+  function setupResizeObserver(panel) {
+    if (typeof ResizeObserver !== 'function') return;
+
+    const observer = new ResizeObserver(() => {
+      panel._updateVerticalScroll?.();
+      panel._updateHorizontalScroll?.();
+    });
+
+    observer.observe(panel);
+    observer.observe(panel.querySelector('.content'));
+    observer.observe(panel.querySelector('.table-stage'));
+
+    panel._resizeObserver = observer;
+  }
+
+  function setupDragging(panel) {
+    const header = panel.querySelector('.header');
+
+    header.addEventListener('pointerdown', event => {
+      if (event.target.closest('button')) return;
+      if (event.button !== 0) return;
+
+      const rect = panel.getBoundingClientRect();
+
+      panel.style.left = `${rect.left}px`;
+      panel.style.top = `${rect.top}px`;
+      panel.style.right = 'auto';
+      panel.style.bottom = 'auto';
+
+      dragging = true;
+      dragOffsetX = event.clientX - rect.left;
+      dragOffsetY = event.clientY - rect.top;
+
+      header.setPointerCapture(event.pointerId);
+      event.preventDefault();
+    });
+
+    header.addEventListener('pointermove', event => {
+      if (!dragging) return;
+
+      const maxLeft = Math.max(
+        0,
+        window.innerWidth - panel.offsetWidth
+      );
+
+      const maxTop = Math.max(
+        0,
+        window.innerHeight - panel.offsetHeight
+      );
+
+      const left = Math.min(
+        maxLeft,
+        Math.max(0, event.clientX - dragOffsetX)
+      );
+
+      const top = Math.min(
+        maxTop,
+        Math.max(0, event.clientY - dragOffsetY)
+      );
+
+      panel.style.left = `${left}px`;
+      panel.style.top = `${top}px`;
+    });
+
+    function stopDragging() {
+      dragging = false;
+    }
+
+    header.addEventListener('pointerup', stopDragging);
+    header.addEventListener('pointercancel', stopDragging);
+
+    window.addEventListener('resize', () => {
+      clampPanel(panel);
+      panel._updateVerticalScroll?.();
+      panel._updateHorizontalScroll?.();
+    });
+  }
+
+  function clampPanel(panel) {
+    if (!panel.isConnected) return;
+
+    const rect = panel.getBoundingClientRect();
+    const width = Math.min(rect.width, window.innerWidth);
+    const height = Math.min(rect.height, window.innerHeight);
+
+    panel.style.maxWidth = `${window.innerWidth}px`;
+    panel.style.maxHeight = `${window.innerHeight}px`;
+
+    const left = Math.max(
+      0,
+      Math.min(rect.left, window.innerWidth - width)
+    );
+
+    const top = Math.max(
+      0,
+      Math.min(rect.top, window.innerHeight - height)
+    );
+
+    panel.style.left = `${left}px`;
+    panel.style.top = `${top}px`;
+    panel.style.right = 'auto';
+    panel.style.bottom = 'auto';
+  }
+
+  function buildRows(markets, listings) {
+    const rows = [];
+    const byId = new Map();
+
+    for (const listing of listings) {
+      if (!byId.has(listing.id)) {
+        byId.set(listing.id, []);
+      }
+
+      byId.get(listing.id).push(listing);
+    }
+
+    for (const market of markets) {
+      const matches = byId.get(market.id);
+      if (!matches) continue;
+
+      for (const listing of matches) {
+        const adjusted = market.price * 0.95;
+        const difference = adjusted - listing.price;
+
+        const rate = adjusted > 0
+          ? difference / adjusted * 100
+          : 0;
+
+        // 总差额 = 单件差额 × Weav3r 集市数量
+        const totalDifference = difference * listing.qty;
+
+        rows.push({
+          itemId: market.id,
+          itemName: market.name,
+          marketSeller: market.seller,
+          weav3rSeller: listing.seller,
+          marketPrice: market.price,
+          weav3rPrice: listing.price,
+          marketQty: market.qty,
+          weav3rQty: listing.qty,
+          difference,
+          totalDifference,
+          rate
+        });
+      }
+    }
+
+    return rows;
+  }
+
+  function getSortedRows() {
+    const rows = [...lastRows];
+
+    if (sortDirection === 'asc') {
+      rows.sort((a, b) => a.difference - b.difference);
+    } else if (sortDirection === 'desc') {
+      rows.sort((a, b) => b.difference - a.difference);
+    }
+
+    return rows;
+  }
+
+  function renderRows() {
+    const panel = ensurePanel();
+    const stage = panel.querySelector('.table-stage');
+    const rows = getSortedRows();
+
+    const directionText = sortDirection === 'asc'
+      ? '差额从小到大'
+      : sortDirection === 'desc'
+        ? '差额从大到小'
+        : '原始顺序';
+
+    panel.querySelector('.status').textContent =
+      `匹配报价 ${rows.length} 组；排序：${directionText}`;
+
+    if (!rows.length) {
+      stage.innerHTML =
+        '<div class="empty">前五条市场报价与前五条 Weav3r 报价没有匹配商品 ID</div>';
+
+      requestAnimationFrame(() => {
+        panel._updateVerticalScroll?.();
+        panel._updateHorizontalScroll?.();
+      });
+
+      return;
+    }
+
+    let html = `
+      <table>
+        <thead>
+          <tr>
+            <th>商品</th>
+            <th>市场卖家</th>
+            <th>Weav3r 卖家</th>
+            <th>市场价</th>
+            <th>Weav3r 价</th>
+            <th>市场 / 集市</th>
+            <th>单件差额</th>
+            <th>总差额</th>
+            <th>差额率</th>
+          </tr>
+        </thead>
+        <tbody>
+    `;
+
+    for (const row of rows) {
+      const differenceClass =
+        row.difference >= 0 ? 'positive' : 'negative';
+
+      const totalClass =
+        row.totalDifference >= 0 ? 'positive' : 'negative';
+
+      const rateClass =
+        row.rate >= 0 ? 'positive' : 'negative';
+
+      html += `
+        <tr>
+          <td>${esc(row.itemName)} (ID ${esc(row.itemId)})</td>
+          <td>${esc(row.marketSeller)}</td>
+          <td>${esc(row.weav3rSeller)}</td>
+          <td>${money(row.marketPrice)}</td>
+          <td>${money(row.weav3rPrice)}</td>
+          <td>${row.marketQty} / ${row.weav3rQty}</td>
+          <td class="${differenceClass}">${money(row.difference)}</td>
+          <td class="${totalClass}">${money(row.totalDifference)}</td>
+          <td class="${rateClass}">${row.rate.toFixed(2)}%</td>
+        </tr>
+      `;
+    }
+
+    html += '</tbody></table>';
+    stage.innerHTML = html;
+
+    requestAnimationFrame(() => {
+      if (!panel.isConnected) return;
+
+      panel._updateVerticalScroll?.();
+      panel._updateHorizontalScroll?.();
+    });
+  }
+
+  function refresh() {
+    if (!document.body) return;
+
+    const markets = getMarketListings().slice(0, MAX);
+    const listings = getWeav3rListings().slice(0, MAX);
+
+    lastRows = buildRows(markets, listings);
+    renderRows();
+
+    const panel = ensurePanel();
+
+    const directionText = sortDirection === 'asc'
+      ? '差额从小到大'
+      : sortDirection === 'desc'
+        ? '差额从大到小'
+        : '原始顺序';
+
+    panel.querySelector('.status').textContent =
+      `市场 ${markets.length}/${MAX} 条；Weav3r ${listings.length}/${MAX} 条；匹配 ${lastRows.length} 组；${directionText}`;
+
+    panel._updateVerticalScroll?.();
+    panel._updateHorizontalScroll?.();
+  }
+
+  function init() {
+    addStyles();
+    ensurePanel();
+    refresh();
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init, { once: true });
+  } else {
+    init();
+  }
+})();
